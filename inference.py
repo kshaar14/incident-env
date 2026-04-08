@@ -4,13 +4,14 @@ import os
 import textwrap
 from typing import List
 from openai import OpenAI
-from openenv.core import EnvClient
-from incident_env.models import IncidentEnvAction, IncidentEnvObservation, IncidentEnvState
+import httpx
+from incident_env.models import IncidentEnvAction, IncidentEnvObservation
 
+# CRITICAL: use API_BASE_URL and API_KEY exactly as injected by the validator
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
-API_KEY = os.getenv("HF_TOKEN")
-HF_SPACE_URL = os.getenv("HF_SPACE_URL", "http://localhost:8000")
+API_KEY = os.getenv("API_KEY") or os.getenv("HF_TOKEN", "dummy")
+HF_SPACE_URL = os.getenv("HF_SPACE_URL", "https://shaark14-incident-env.hf.space")
 
 TASKS = [
     "task_easy_payment_timeout",
@@ -44,18 +45,19 @@ def log_end(success, steps, score, rewards):
     print(f"[END] success={str(success).lower()} steps={steps} score={score:.2f} rewards={r}", flush=True)
 
 
-def get_action(client, obs, history):
+def get_action(client: OpenAI, obs: IncidentEnvObservation, history: List[str]):
     prompt = f"""Alert: {obs.alert_summary}
 Last tool output: {obs.tool_output or 'None'}
 Feedback: {obs.step_feedback}
-Status: {obs.incident_status} | Steps taken: {obs.elapsed_steps}
+Status: {obs.incident_status} | Steps: {obs.elapsed_steps}
 Available tools: {obs.available_tools}
 Available runbooks: {obs.available_runbooks}
-Recent history: {history[-3:]}
+History: {history[-3:]}
 
 Respond with JSON action only."""
 
     try:
+        # This call MUST go through API_BASE_URL so the proxy sees it
         resp = client.chat.completions.create(
             model=MODEL_NAME,
             messages=[
@@ -70,7 +72,9 @@ Respond with JSON action only."""
         data = json.loads(raw)
         return IncidentEnvAction(**data), raw
     except Exception as e:
-        action = IncidentEnvAction(action_type="resolve", root_cause="parse error", resolution_note=str(e))
+        action = IncidentEnvAction(
+            action_type="escalate",
+        )
         return action, f"fallback:{e}"
 
 
@@ -78,18 +82,16 @@ async def run_task(task_id: str, client: OpenAI) -> float:
     log_start(task_id, BENCHMARK, MODEL_NAME)
     rewards: List[float] = []
     steps_taken = 0
-    score = 0.0
+    base = HF_SPACE_URL.rstrip("/")
 
     try:
-        # Use raw HTTP instead of WebSocket client to avoid abstract method issues
-        import httpx
-        base = HF_SPACE_URL.rstrip("/")
-
-        async with httpx.AsyncClient(timeout=30) as http:
+        async with httpx.AsyncClient(timeout=60) as http:
             # Reset
-            r = await http.post(f"{base}/reset",
+            r = await http.post(
+                f"{base}/reset",
                 json={"task_id": task_id},
-                headers={"Content-Type": "application/json"})
+                headers={"Content-Type": "application/json"},
+            )
             data = r.json()
             obs = IncidentEnvObservation(**data["observation"])
             done = data.get("done", False)
@@ -101,10 +103,11 @@ async def run_task(task_id: str, client: OpenAI) -> float:
 
                 action, raw = get_action(client, obs, history)
 
-                # Step
-                r = await http.post(f"{base}/step",
+                r = await http.post(
+                    f"{base}/step",
                     json={"action": action.model_dump(exclude_none=True)},
-                    headers={"Content-Type": "application/json"})
+                    headers={"Content-Type": "application/json"},
+                )
                 data = r.json()
                 obs = IncidentEnvObservation(**data["observation"])
                 reward = float(data.get("reward", 0.0))
@@ -113,7 +116,7 @@ async def run_task(task_id: str, client: OpenAI) -> float:
                 rewards.append(reward)
                 steps_taken = step
                 history.append(f"step={step} {action.action_type} reward={reward:.2f}")
-                log_step(step, raw[:100].replace("\n"," "), reward, done, None)
+                log_step(step, raw[:100].replace("\n", " "), reward, done, None)
 
                 if done:
                     break
@@ -130,7 +133,11 @@ async def run_task(task_id: str, client: OpenAI) -> float:
 
 
 async def main():
-    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+    # Initialize OpenAI client with API_BASE_URL and API_KEY from environment
+    client = OpenAI(
+        base_url=API_BASE_URL,
+        api_key=API_KEY,
+    )
     total = 0.0
     for task_id in TASKS:
         score = await run_task(task_id, client)
