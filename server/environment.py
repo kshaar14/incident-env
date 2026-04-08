@@ -8,6 +8,20 @@ MAX_STEPS = 15
 STEP_PENALTY = 0.01
 
 
+def _find_tool_response(tool_responses: dict, tool_name: str, service: str, window: str):
+    """Match tool response by tool+service, ignoring window mismatch."""
+    # exact match first
+    exact = f"{tool_name}:{service}:{window}"
+    if exact in tool_responses:
+        return exact, tool_responses[exact]
+    # fuzzy: same tool+service, any window
+    prefix = f"{tool_name}:{service}:"
+    for key, val in tool_responses.items():
+        if key.startswith(prefix):
+            return key, val
+    return None, None
+
+
 class IncidentEnvEnvironment(Environment):
     def __init__(self):
         super().__init__()
@@ -46,20 +60,22 @@ class IncidentEnvEnvironment(Environment):
         if action.action_type == "query_tool":
             svc = (action.tool_args or {}).get("service", "")
             win = (action.tool_args or {}).get("window", "")
-            key = f"{action.tool_name}:{svc}:{win}"
-            result = self._task["tool_responses"].get(key)
+            matched_key, result = _find_tool_response(
+                self._task["tool_responses"], action.tool_name, svc, win
+            )
             if result:
                 tool_output = result
-                self._state.queries_made.append(key)
+                if matched_key not in self._state.queries_made:
+                    self._state.queries_made.append(matched_key)
                 reward += 0.05
-                feedback = f"Tool '{action.tool_name}' returned data for service='{svc}' window='{win}'."
+                feedback = f"Tool '{action.tool_name}' returned data for service='{svc}'."
             else:
                 available = list(self._task["tool_responses"].keys())
                 tool_output = (
-                    f"No data for tool='{action.tool_name}' service='{svc}' window='{win}'. "
-                    f"Example valid query: {available[0]!r}"
+                    f"No data for tool='{action.tool_name}' service='{svc}'. "
+                    f"Available services: {list(set(k.split(':')[1] for k in available))}"
                 )
-                feedback = "Tool query returned no results. Adjust service name or window."
+                feedback = "No data found. Check the service name."
 
         elif action.action_type == "set_severity":
             self._state.severity_set = True
@@ -74,7 +90,7 @@ class IncidentEnvEnvironment(Environment):
                 reward += 0.3 if correct else -0.1
                 feedback = (
                     f"Runbook '{rb}' applied: {self._task['runbooks'][rb]}. "
-                    + ("Correct remediation." if correct else "This may not address root cause.")
+                    + ("Correct remediation." if correct else "May not address root cause.")
                 )
             else:
                 feedback = f"Unknown runbook '{rb}'. Check available_runbooks."
@@ -92,7 +108,7 @@ class IncidentEnvEnvironment(Environment):
 
         if self._state.step_count >= MAX_STEPS and not done:
             done = True
-            feedback += " Max steps reached — episode ended."
+            feedback += " Max steps reached."
 
         return IncidentEnvObservation(
             reward=round(reward, 4),
@@ -110,8 +126,3 @@ class IncidentEnvEnvironment(Environment):
     @property
     def state(self) -> IncidentEnvState:
         return self._state
-
-    def get_state(self) -> dict:
-        if self._state is None:
-            return IncidentEnvState(episode_id='uninitialised', task_id='').model_dump()
-        return self._state.model_dump()
