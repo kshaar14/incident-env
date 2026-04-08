@@ -2,15 +2,15 @@ import asyncio
 import json
 import os
 import textwrap
-from typing import List, Optional
+from typing import List
 from openai import OpenAI
-from incident_env.client import IncidentEnvClient
-from incident_env.models import IncidentEnvAction
+from openenv.core import EnvClient
+from incident_env.models import IncidentEnvAction, IncidentEnvObservation, IncidentEnvState
 
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
 API_KEY = os.getenv("HF_TOKEN")
-HF_SPACE_URL = os.getenv("HF_SPACE_URL", "https://shaark14-incident-env.hf.space")
+HF_SPACE_URL = os.getenv("HF_SPACE_URL", "http://localhost:8000")
 
 TASKS = [
     "task_easy_payment_timeout",
@@ -20,52 +20,40 @@ TASKS = [
 MAX_STEPS = 12
 BENCHMARK = "incident_env"
 
-SYSTEM_PROMPT = textwrap.dedent("""
-    You are an expert SRE (Site Reliability Engineer) responding to production incidents.
-    You investigate by querying tools, then apply the correct runbook, then resolve.
+SYSTEM_PROMPT = """You are an expert SRE responding to production incidents.
+Investigate by querying tools, apply the correct runbook, then resolve.
 
-    Available action_types:
-    - query_tool: query logs/metrics/traces/topology
-    - set_severity: set incident severity (P1/P2/P3)
-    - apply_runbook: apply a runbook by ID
-    - escalate: escalate to senior SRE
-    - resolve: close the incident with your root cause diagnosis
+Respond ONLY with valid JSON. Examples:
+{"action_type":"query_tool","tool_name":"logs","tool_args":{"service":"payment-api","window":"5m"}}
+{"action_type":"query_tool","tool_name":"metrics","tool_args":{"service":"payment-api","window":"5m"}}
+{"action_type":"set_severity","severity":"P1"}
+{"action_type":"apply_runbook","runbook_id":"runbook_db_pool_scale"}
+{"action_type":"resolve","root_cause":"database connection pool exhausted","resolution_note":"scaled pool"}
 
-    Always respond with ONLY valid JSON matching one of these schemas:
-    {"action_type":"query_tool","tool_name":"logs","tool_args":{"service":"payment-api","window":"5m"}}
-    {"action_type":"set_severity","severity":"P1"}
-    {"action_type":"apply_runbook","runbook_id":"runbook_db_pool_scale"}
-    {"action_type":"resolve","root_cause":"your diagnosis here","resolution_note":"steps taken"}
-
-    Strategy: query 2-3 tools first to gather evidence, then set severity, apply the correct runbook, then resolve.
-    No explanation. JSON only.
-""").strip()
+No explanation. JSON only."""
 
 
 def log_start(task, env, model):
     print(f"[START] task={task} env={env} model={model}", flush=True)
 
 def log_step(step, action, reward, done, error):
-    err = error if error else "null"
-    print(f"[STEP] step={step} action={action} reward={reward:.2f} done={str(done).lower()} error={err}", flush=True)
+    print(f"[STEP] step={step} action={action} reward={reward:.2f} done={str(done).lower()} error={error or 'null'}", flush=True)
 
 def log_end(success, steps, score, rewards):
     r = ",".join(f"{r:.2f}" for r in rewards)
     print(f"[END] success={str(success).lower()} steps={steps} score={score:.2f} rewards={r}", flush=True)
 
 
-def get_action(client, obs, step, history) -> tuple[IncidentEnvAction, str]:
-    prompt = textwrap.dedent(f"""
-        ALERT: {obs.alert_summary}
-        Last tool output: {obs.tool_output or 'None'}
-        Feedback: {obs.step_feedback}
-        Status: {obs.incident_status} | Step: {obs.elapsed_steps}
-        Available tools: {obs.available_tools}
-        Available runbooks: {obs.available_runbooks}
-        History: {history[-4:]}
+def get_action(client, obs, history):
+    prompt = f"""Alert: {obs.alert_summary}
+Last tool output: {obs.tool_output or 'None'}
+Feedback: {obs.step_feedback}
+Status: {obs.incident_status} | Steps taken: {obs.elapsed_steps}
+Available tools: {obs.available_tools}
+Available runbooks: {obs.available_runbooks}
+Recent history: {history[-3:]}
 
-        Respond with JSON action only.
-    """).strip()
+Respond with JSON action only."""
 
     try:
         resp = client.chat.completions.create(
@@ -74,7 +62,7 @@ def get_action(client, obs, step, history) -> tuple[IncidentEnvAction, str]:
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": prompt},
             ],
-            max_tokens=200,
+            max_tokens=150,
             temperature=0.2,
         )
         raw = (resp.choices[0].message.content or "").strip()
@@ -82,12 +70,8 @@ def get_action(client, obs, step, history) -> tuple[IncidentEnvAction, str]:
         data = json.loads(raw)
         return IncidentEnvAction(**data), raw
     except Exception as e:
-        fallback = IncidentEnvAction(
-            action_type="resolve",
-            root_cause="parse error fallback",
-            resolution_note=str(e),
-        )
-        return fallback, f"error:{e}"
+        action = IncidentEnvAction(action_type="resolve", root_cause="parse error", resolution_note=str(e))
+        return action, f"fallback:{e}"
 
 
 async def run_task(task_id: str, client: OpenAI) -> float:
@@ -95,42 +79,54 @@ async def run_task(task_id: str, client: OpenAI) -> float:
     rewards: List[float] = []
     steps_taken = 0
     score = 0.0
-    success = False
 
     try:
-        async with IncidentEnvClient(base_url=HF_SPACE_URL) as env:
-            result = await env.reset(task_id=task_id)
-            obs = result.observation
+        # Use raw HTTP instead of WebSocket client to avoid abstract method issues
+        import httpx
+        base = HF_SPACE_URL.rstrip("/")
+
+        async with httpx.AsyncClient(timeout=30) as http:
+            # Reset
+            r = await http.post(f"{base}/reset",
+                json={"task_id": task_id},
+                headers={"Content-Type": "application/json"})
+            data = r.json()
+            obs = IncidentEnvObservation(**data["observation"])
+            done = data.get("done", False)
             history = []
 
             for step in range(1, MAX_STEPS + 1):
-                if result.done:
+                if done:
                     break
 
-                action, raw = get_action(client, obs, step, history)
-                result = await env.step(action)
-                obs = result.observation
-                reward = result.reward or 0.0
-                done = result.done
+                action, raw = get_action(client, obs, history)
+
+                # Step
+                r = await http.post(f"{base}/step",
+                    json={"action": action.model_dump(exclude_none=True)},
+                    headers={"Content-Type": "application/json"})
+                data = r.json()
+                obs = IncidentEnvObservation(**data["observation"])
+                reward = float(data.get("reward", 0.0))
+                done = bool(data.get("done", False))
 
                 rewards.append(reward)
                 steps_taken = step
-                history.append(f"step={step} type={action.action_type} reward={reward:.2f}")
-                log_step(step, raw[:120].replace("\n", " "), reward, done, None)
+                history.append(f"step={step} {action.action_type} reward={reward:.2f}")
+                log_step(step, raw[:100].replace("\n"," "), reward, done, None)
 
                 if done:
                     break
 
         score = min(max(sum(rewards), 0.0), 1.0)
         success = score >= 0.3
+        log_end(success, steps_taken, score, rewards)
+        return score
 
     except Exception as e:
         print(f"[DEBUG] Task {task_id} error: {e}", flush=True)
         log_end(False, steps_taken, 0.0, rewards)
         return 0.0
-
-    log_end(success, steps_taken, score, rewards)
-    return score
 
 
 async def main():
