@@ -1,0 +1,25 @@
+spec_version: 1
+name: incident_env
+version: "1.0.0"
+description: >
+  SRE Incident Response environment. An agent diagnoses and resolves
+  production incidents by querying logs, metrics, traces, and topology tools,
+  then applying the correct runbook. 3 tasks: easy, medium, hard.
+type: environment
+runtime:
+  type: docker
+  dockerfile: Dockerfile
+app:
+  module: server.app
+  object: app
+port: 8000
+tasks:
+  - id: task_easy_payment_timeout
+    difficulty: easy
+    description: "Payment API p99 latency spike — single service DB pool exhaustion"
+  - id: task_medium_checkout_cascade
+    difficulty: medium
+    description: "Checkout cascade failure from inventory memory leak"
+  - id: task_hard_auth_degradation
+    difficulty: hard
+    description: "Subtle auth degradation from partial certificate rollout"
